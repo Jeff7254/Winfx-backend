@@ -23,7 +23,7 @@ app.post('/api/deposit', async (req,res)=>{
   let { phone, amount } = req.body;
   phone = cleanPhone(phone); amount = parseInt(amount);
   try{
-    const resp = await axios.post('https://api.lipwa.app/v1/stk-push',{
+    const resp = await axios.post('https://api.lipwa.co.ke/v1/stk-push',{
       phone, amount,
       channel_id: process.env.LIPWA_CHANNEL_ID,
       external_id: 'DEP'+Date.now(),
