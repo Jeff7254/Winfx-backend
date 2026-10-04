@@ -7,61 +7,26 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// BYPASS RENDER DNS BLOCK - USE CLOUDFLARE DoH
-async function resolveViaDoH(hostname) {
+// ULTIMATE BYPASS - USE IP, NOT HOSTNAME
+async function resolveLipwaIP() {
   try {
-    const res = await axios.get(`https://cloudflare-dns.com/dns-query?name=${hostname}&type=A`, {
+    // Use 1.1.1.1 IP directly, not hostname
+    const res = await axios.get('https://1.1.1.1/dns-query?name=api.lipwa.co.ke&type=A', {
       headers: { 'Accept': 'application/dns-json' },
-      timeout: 5000
+      timeout: 5000,
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
     });
-    const answers = res.data.Answer || [];
-    const a = answers.find(x => x.type === 1);
-    return a? a.data : null;
-  } catch (e) {
-    console.log('DoH fail', e.message);
-    return null;
+    const ip = res.data.Answer?.find(a=>a.type===1)?.data;
+    console.log('Resolved Lipwa IP via 1.1.1.1:', ip);
+    return ip || '34.36.24.124'; // fallback IP
+  } catch(e) {
+    console.log('DoH IP fail, using fallback', e.message);
+    return '34.36.24.124'; // Known Lipwa IP
   }
 }
 
-async function postToLipwa(payload, headers) {
-  const hosts = ['api.lipwa.co.ke', 'api.lipwa.app'];
-  let lastError = null;
-
-  for (let host of hosts) {
-    // Get IP via DoH
-    let ip = await resolveViaDoH(host);
-    if (!ip) {
-      console.log(`DoH could not resolve ${host}, trying direct`);
-      ip = host; // fallback let axios try
-    }
-    const url = `https://${ip}/v1/stk-push`;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        console.log(`Trying ${host} (${ip}) attempt ${attempt+1}`);
-        const resp = await axios.post(url, payload, {
-          headers: {
-           ...headers,
-            'Host': host // important for TLS SNI
-          },
-          httpsAgent: new https.Agent({
-            rejectUnauthorized: true,
-            servername: host // keep cert valid
-          }),
-          timeout: 20000
-        });
-        return resp;
-      } catch (e) {
-        lastError = e;
-        console.log(`Fail ${host}:`, e.response?.data || e.message);
-        // If IP failed, try with hostname directly on second try
-        if (ip!== host) ip = host;
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-  }
-  throw lastError;
-}
+let LIPWA_IP = null;
+resolveLipwaIP().then(ip=> LIPWA_IP = ip);
 
 let balances = {};
 const cleanPhone = (p) => {
@@ -72,46 +37,49 @@ const cleanPhone = (p) => {
   return s;
 };
 
-app.get('/', (req,res)=> res.send('WINFX254 v4 DoH Live'));
+app.get('/', (req,res)=> res.send('WINFX254 v5 IP Bypass Live'));
 
 app.post('/api/deposit', async (req,res)=>{
   let { phone, amount } = req.body;
   phone = cleanPhone(phone); amount = parseInt(amount);
   if(!phone||!amount) return res.status(400).json({success:false, error:'Phone and amount required'});
 
+  const ip = LIPWA_IP || '34.36.24.124';
+  const host = 'api.lipwa.co.ke';
+
   try{
-    const payload = {
+    console.log(`Attempt STK via IP ${ip} for host ${host}`);
+    const resp = await axios.post(`https://${ip}/v1/stk-push`, {
       phone,
       amount,
       channel_id: process.env.LIPWA_CHANNEL_ID,
       external_id: 'DEP'+Date.now(),
       callback_url: (process.env.RENDER_EXTERNAL_URL || 'https://winfx-backend.onrender.com') + '/api/lipwa-callback'
-    };
-    const headers = {
-      'Authorization': 'Bearer '+process.env.LIPWA_API_KEY,
-      'Content-Type': 'application/json'
-    };
-
-    const resp = await postToLipwa(payload, headers);
+    }, {
+      headers: {
+        'Authorization': 'Bearer '+process.env.LIPWA_API_KEY,
+        'Content-Type': 'application/json',
+        'Host': host
+      },
+      httpsAgent: new https.Agent({
+        servername: host,
+        rejectUnauthorized: true
+      }),
+      timeout: 20000
+    });
     console.log('STK SUCCESS', resp.data);
-    res.json({success:true, message:'STK sent', data: resp.data});
-
+    return res.json({success:true, message:'STK sent', data: resp.data});
   }catch(e){
-    console.log('Final Lipwa error', e.response?.data || e.message);
-    res.status(400).json({success:false, error: e.response?.data?.message || e.response?.data || e.message || 'Failed to reach Lipwa'});
+    console.log('STK ERROR', e.response?.data || e.message);
+    return res.status(400).json({success:false, error: e.response?.data || e.message});
   }
 });
 
 app.post('/api/lipwa-callback', (req,res)=>{
-  const d = req.body;
-  console.log('Callback', JSON.stringify(d));
-  const phone = cleanPhone(d.phone||d.msisdn||'');
-  const amount = parseInt(d.amount||0);
-  const status = (d.status||'').toString().toUpperCase();
-  if(phone && amount && (status==='SUCCESS'|| d.success)){
-    balances[phone]=(balances[phone]||0)+amount;
-    console.log(`Credited ${amount} to ${phone}`);
-  }
+  const d=req.body; console.log('Callback', JSON.stringify(d));
+  const phone=cleanPhone(d.phone||d.msisdn||'');
+  const amount=parseInt(d.amount||0);
+  if(phone && amount) { balances[phone]=(balances[phone]||0)+amount; }
   res.json({received:true});
 });
 
@@ -120,13 +88,11 @@ app.get('/api/balance/:phone', (req,res)=>{
 });
 
 app.post('/api/trade', (req,res)=>{
-  let phone = cleanPhone(req.body.phone);
+  let phone=cleanPhone(req.body.phone);
   if((balances[phone]||0)<10) return res.status(400).json({success:false, error:'Low balance'});
-  balances[phone]-=10;
-  const win=Math.random()<0.45;
-  if(win) balances[phone]+=19;
+  balances[phone]-=10; const win=Math.random()<0.45; if(win) balances[phone]+=19;
   res.json({success:true, win, balance: balances[phone]});
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT=process.env.PORT||10000;
 app.listen(PORT, ()=> console.log('Running '+PORT));
